@@ -139,4 +139,5 @@ if __name__ == "__main__":
         data_folder_path = os.path.abspath(RAW_DATA_DIR)
         print(f"数据已保存至 '{data_folder_path}' 文件夹中。")
     else:
+
         print("\n未能获取股票列表，程序已终止。请检查网络连接或维基百科页面结构是否变更。")
