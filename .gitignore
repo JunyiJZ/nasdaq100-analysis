@@ -7,9 +7,9 @@ __pycache__/
 *.pyd
 
 # Virtual Environment
-venv/
 .venv/
 env/
+venv/   # <-- ADD THIS LINE
 *.env
 pyvenv.cfg
 
@@ -22,7 +22,6 @@ data/
 # Ignore all .csv and .xlsx files
 *.csv
 *.xlsx
-/data/finalized/data_with_targets.csv
 
 # IDE / Editor specific
 .vscode/
