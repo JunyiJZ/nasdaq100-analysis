@@ -17,10 +17,11 @@ pyvenv.cfg
 .ipynb_checkpoints/
 
 # Data & Generated Files
-# 忽略所有在 data 文件夹下的内容
+# Ignore all data files
 data/
-# 忽略所有 .csv 文件
+# Ignore all .csv and .xlsx files
 *.csv
+*.xlsx
 
 # IDE / Editor specific
 .vscode/
