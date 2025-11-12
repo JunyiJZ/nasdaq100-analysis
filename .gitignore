@@ -1,0 +1,28 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environment
+venv/
+.venv/
+env/
+*.env
+pyvenv.cfg
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Data & Generated Files
+# Ignore all data files
+data/
+# Ignore all .csv and .xlsx files
+*.csv
+*.xlsx
+
+# IDE / Editor specific
+.vscode/
+.idea/
