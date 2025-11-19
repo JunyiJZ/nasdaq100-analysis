@@ -19,6 +19,7 @@ data/
 # Ignore all .csv and .xlsx files
 .csv
 .xlsx
+features_technical.csv
 
 # IDE / Editor specific
 .vscode/
