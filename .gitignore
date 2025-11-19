@@ -2,16 +2,13 @@
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+.pyc
+.pyo
+.pyd
 
 # Virtual Environment
-.venv/
+venv/
 env/
-venv/   # <-- ADD THIS LINE
-*.env
-pyvenv.cfg
 
 # Jupyter Notebook
 .ipynb_checkpoints/
@@ -20,8 +17,8 @@ pyvenv.cfg
 # Ignore all data files
 data/
 # Ignore all .csv and .xlsx files
-*.csv
-*.xlsx
+.csv
+.xlsx
 
 # IDE / Editor specific
 .vscode/
