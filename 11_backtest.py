@@ -16,16 +16,18 @@ PARAMS_PATH = 'models/tuned_models/best_hyperparameters.json'
 RESULTS_DIR = 'data/backtest_results'
 SEQ_LENGTH = 60
 
-# 交易策略配置 (激进模式)
-BUY_THRESHOLD = 0.50  # 预测概率 > 0.50 就买
-SELL_THRESHOLD = 0.50 # 预测概率 < 0.50 就卖
+# 交易策略配置 (优化版)
 INITIAL_CAPITAL = 10000
+
+# 关键修改：引入置信度阈值，防止长期模型在 0.5 附近频繁震荡
+# 只有当模型非常有信心时才交易
+CONFIDENCE_THRESHOLD = 0.05  # 0.5 +/- 0.05 -> Buy > 0.55, Sell < 0.45
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # ==========================================
-# 2. 模型定义 (必须与 Week 10 保持一致)
+# 2. 模型定义 (保持不变)
 # ==========================================
 class LSTMClassifier(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers, dropout):
@@ -81,10 +83,20 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 # ==========================================
-# 3. 辅助函数
+# 3. 辅助函数 (关键修复)
 # ==========================================
-def prepare_data(df, ticker, horizon_days):
-    """与 Week 10 逻辑一致的数据准备"""
+def create_sequences(data_x, data_y, prices, seq_length):
+    xs, ys, ps = [], [], []
+    for i in range(len(data_x) - seq_length):
+        xs.append(data_x[i:(i + seq_length)])
+        ys.append(data_y[i + seq_length])
+        ps.append(prices[i + seq_length])
+    return np.array(xs), np.array(ys), np.array(ps)
+
+def prepare_data_split(df, ticker, horizon_days):
+    """
+    修复了数据泄露问题：先划分 Train/Test，再进行 Scaling
+    """
     t_df = df[df['Ticker'] == ticker].copy()
     if 'Date' in t_df.columns:
         t_df['Date'] = pd.to_datetime(t_df['Date'])
@@ -93,36 +105,45 @@ def prepare_data(df, ticker, horizon_days):
     # 确定价格列
     price_col = 'Close' if 'Close' in t_df.columns else t_df.select_dtypes(include=[np.number]).columns[0]
     
-    # 生成 Target
+    # 生成 Target (注意：最后 horizon_days 行的 Target 是 NaN，需要去掉)
     t_df['Target'] = (t_df[price_col].shift(-horizon_days) > t_df[price_col]).astype(float)
-    t_df = t_df.dropna(subset=['Target'])
+    t_df = t_df.dropna(subset=['Target']) # 这里会丢弃最后几天的数据
     
-    # 特征
+    # 特征选择
     feature_cols = [c for c in t_df.columns if c not in ['Date', 'Ticker', 'Target'] and not c.startswith('target_')]
     numeric_cols = t_df.select_dtypes(include=[np.number]).columns.tolist()
     feature_cols = [c for c in feature_cols if c in numeric_cols]
     
-    # 原始价格用于回测计算收益
+    # 提取原始数据
+    raw_x = t_df[feature_cols].values
+    raw_y = t_df['Target'].values
     raw_prices = t_df[price_col].values
     
-    data_x = t_df[feature_cols].values
-    data_y = t_df['Target'].values
+    # --- 关键修复：按时间切分 Train/Test ---
+    split_idx = int(len(raw_x) * 0.8)
     
+    train_x_raw = raw_x[:split_idx]
+    test_x_raw = raw_x[split_idx:]
+    
+    train_y = raw_y[:split_idx]
+    test_y = raw_y[split_idx:]
+    
+    train_prices = raw_prices[:split_idx]
+    test_prices = raw_prices[split_idx:]
+    
+    # --- 关键修复：只在 Train 上 Fit Scaler ---
     scaler = StandardScaler()
-    data_x = scaler.fit_transform(data_x)
+    train_x_scaled = scaler.fit_transform(train_x_raw)
+    test_x_scaled = scaler.transform(test_x_raw) # 用训练集的参数转换测试集
     
-    xs, ys, prices = [], [], []
-    for i in range(len(data_x) - SEQ_LENGTH):
-        xs.append(data_x[i:(i + SEQ_LENGTH)])
-        ys.append(data_y[i + SEQ_LENGTH])
-        prices.append(raw_prices[i + SEQ_LENGTH]) # 记录对应当天的价格
-        
-    return np.array(xs), np.array(ys), np.array(prices), len(feature_cols)
+    # 生成序列
+    X_train, y_train, _ = create_sequences(train_x_scaled, train_y, train_prices, SEQ_LENGTH)
+    X_test, y_test, prices_test = create_sequences(test_x_scaled, test_y, test_prices, SEQ_LENGTH)
+    
+    return X_train, y_train, X_test, y_test, prices_test, len(feature_cols)
 
 def train_and_predict(model_cls, params, input_dim, X_train, y_train, X_test):
-    """根据参数实例化模型，训练，并预测"""
-    
-    # 1. 实例化模型
+    """训练并预测"""
     model_type = params['model_type']
     dropout = params['dropout']
     
@@ -131,11 +152,9 @@ def train_and_predict(model_cls, params, input_dim, X_train, y_train, X_test):
     elif model_type == 'GRU':
         model = GRUClassifier(input_dim, params['gru_hidden'], params['gru_layers'], dropout).to(device)
     elif model_type == 'Transformer':
-        # 重新计算 d_model
         d_model = params['nhead'] * params['d_model_mult']
         model = TransformerClassifier(input_dim, d_model, params['nhead'], params['tf_layers'], dropout).to(device)
     
-    # 2. 训练
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=params['lr'])
     
@@ -143,8 +162,8 @@ def train_and_predict(model_cls, params, input_dim, X_train, y_train, X_test):
     yt = torch.FloatTensor(y_train).unsqueeze(1).to(device)
     
     model.train()
-    # 稍微多训练几轮以确保收敛
-    epochs = 15 
+    # 增加 Epochs，因为现在数据更“真实难学”了
+    epochs = 20 
     for _ in range(epochs):
         optimizer.zero_grad()
         out = model(xt)
@@ -152,7 +171,6 @@ def train_and_predict(model_cls, params, input_dim, X_train, y_train, X_test):
         loss.backward()
         optimizer.step()
         
-    # 3. 预测
     model.eval()
     with torch.no_grad():
         xv = torch.FloatTensor(X_test).to(device)
@@ -164,85 +182,81 @@ def train_and_predict(model_cls, params, input_dim, X_train, y_train, X_test):
 # 4. 主回测引擎
 # ==========================================
 def run_backtest_engine():
-    print("🚀 Starting Week 11: Backtesting Engine (PyTorch)...")
+    print("🚀 Starting Week 11: Backtesting Engine (Fixed Leakage)...")
     
     if not os.path.exists(PARAMS_PATH):
-        print("❌ Best hyperparameters not found. Please run Week 10 first.")
+        print("❌ Best hyperparameters not found.")
         return
 
     with open(PARAMS_PATH, 'r') as f:
         best_params_registry = json.load(f)
         
     df = pd.read_csv(DATA_PATH)
-    
     results = []
     
-    # 遍历所有已调优的股票和周期
     for ticker, horizons in best_params_registry.items():
         for horizon_name, params in horizons.items():
-            print(f"\n🔄 Backtesting: {ticker} [{horizon_name}] using {params['model_type']}...")
+            print(f"\n🔄 Backtesting: {ticker} [{horizon_name}]...")
             
             horizon_days = {'Short': 1, 'Mid': 5, 'Long': 10}.get(horizon_name, 1)
             
-            # 1. 准备数据
-            X, y, prices, input_dim = prepare_data(df, ticker, horizon_days)
-            
-            if len(X) < 100:
+            # 1. 准备数据 (使用修复后的函数)
+            try:
+                X_train, y_train, X_test, y_test, prices_test, input_dim = prepare_data_split(df, ticker, horizon_days)
+            except ValueError:
+                print("   ⚠️ Not enough data to split.")
+                continue
+
+            if len(X_train) < 100 or len(X_test) < 10:
                 print("   ⚠️ Not enough data.")
                 continue
                 
-            # 2. 划分训练/测试集 (80% 训练, 20% 回测)
-            split = int(len(X) * 0.8)
-            X_train, X_test = X[:split], X[split:]
-            y_train, y_test = y[:split], y[split:]
-            prices_test = prices[split:]
-            
-            # 3. 重新训练并预测
+            # 2. 训练并预测
             try:
                 probs = train_and_predict(None, params, input_dim, X_train, y_train, X_test)
             except Exception as e:
                 print(f"   ❌ Model Error: {e}")
                 continue
             
-            # 4. 执行交易策略 (Simulation)
+            # 3. 执行交易策略 (加入置信度过滤)
             cash = INITIAL_CAPITAL
-            position = 0 # 0 = 空仓, >0 = 持仓股数
+            position = 0 
             trades = 0
             
-            # 记录资产曲线
-            portfolio_values = []
+            # 动态调整阈值：Long 模型需要更高的确定性，或者更宽的容错
+            buy_thresh = 0.50 + CONFIDENCE_THRESHOLD
+            sell_thresh = 0.50 - CONFIDENCE_THRESHOLD
             
             for i in range(len(probs) - 1):
                 current_price = prices_test[i]
                 prob = probs[i]
                 
-                # 激进策略逻辑
-                if prob > BUY_THRESHOLD and position == 0:
-                    # 买入 (全仓)
+                # 只有当概率显著偏离 0.5 时才操作
+                if prob > buy_thresh and position == 0:
                     position = cash / current_price
                     cash = 0
                     trades += 1
-                elif prob < SELL_THRESHOLD and position > 0:
-                    # 卖出 (清仓)
+                elif prob < sell_thresh and position > 0:
                     cash = position * current_price
                     position = 0
                     trades += 1
                 
-                # 计算当前总资产
-                curr_val = cash + (position * current_price)
-                portfolio_values.append(curr_val)
-            
-            # 5. 结算
+            # 4. 结算
             final_price = prices_test[-1]
             final_value = cash + (position * final_price)
             roi = (final_value - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
             
-            # 简单的基准对比 (Buy & Hold)
+            # 计算基准
             initial_price = prices_test[0]
             buy_hold_roi = (final_price - initial_price) / initial_price * 100
             
-            print(f"   💰 Final Value: ${final_value:.2f} | ROI: {roi:.2f}% | Trades: {trades}")
-            print(f"   📊 Buy & Hold ROI: {buy_hold_roi:.2f}%")
+            # 计算胜率 (方向预测准确率)
+            # 将概率转为 0/1 预测
+            pred_dirs = (probs > 0.5).astype(float)
+            accuracy = (pred_dirs == y_test).mean() * 100
+            
+            print(f"   💰 Final: ${final_value:.2f} | ROI: {roi:.2f}% | Trades: {trades}")
+            print(f"   🎯 Win Rate (Accuracy): {accuracy:.2f}%")
             
             results.append({
                 'Ticker': ticker,
@@ -251,17 +265,78 @@ def run_backtest_engine():
                 'ROI': roi,
                 'Buy_Hold_ROI': buy_hold_roi,
                 'Trades': trades,
-                'Win_Rate': 'N/A' # 暂略
+                'Win_Rate': f"{accuracy:.1f}%"
             })
 
-    # 保存结果
     res_df = pd.DataFrame(results)
     save_path = os.path.join(RESULTS_DIR, 'backtest_summary.csv')
     res_df.to_csv(save_path, index=False)
-    print("\n" + "="*40)
-    print(f"✅ Backtest Complete. Results saved to: {save_path}")
+    
     if not res_df.empty:
-        print(res_df[['Ticker', 'Horizon', 'Model', 'ROI', 'Trades']])
+        print("\n" + "="*60)
+        # 格式化输出，方便查看
+        print(res_df[['Ticker', 'Horizon', 'Model', 'ROI', 'Buy_Hold_ROI', 'Trades', 'Win_Rate']].to_string(index=False))
 
 if __name__ == "__main__":
     run_backtest_engine()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    

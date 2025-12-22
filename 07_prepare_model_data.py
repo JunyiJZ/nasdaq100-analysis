@@ -6,15 +6,19 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 
 # --- 配置 ---
-# 定义最终数据集的正确文件路径
+# 1. 输入文件路径
 FINAL_MASTER_DATASET_FILE = os.path.join('data', 'finalized', 'final_master_dataset.csv')
 
-# 定义模型输入数据的输出文件夹
+# 2. 模型训练数据输出路径 (X_train, y_train 等)
 MODEL_INPUT_PATH = Path('data') / 'final'
+
+# 3. [新增] 回测数据输出路径 (这是 12号脚本 报错找不到的那个路径)
+BACKTEST_DATA_DIR = Path('share') / 'data'
+BACKTEST_DATA_FILE = BACKTEST_DATA_DIR / 'feature_engineered_data.csv'
 
 def prepare_model_data():
     """
-    主函数：加载主数据集，进行特征缩放，划分训练/验证/测试集，并保存。
+    主函数：加载主数据集，进行特征缩放，保存回测数据，划分训练/验证/测试集。
     """
     print("--- 开始执行步骤 7: 准备模型数据 ---")
 
@@ -22,7 +26,7 @@ def prepare_model_data():
     try:
         df = pd.read_csv(FINAL_MASTER_DATASET_FILE, parse_dates=['Date'])
         print(f"成功加载 '{FINAL_MASTER_DATASET_FILE}'")
-        print(f"初始数据形状: {df.shape}") # <-- 诊断信息1
+        print(f"初始数据形状: {df.shape}") 
     except FileNotFoundError:
         print(f"错误：找不到主数据文件 '{FINAL_MASTER_DATASET_FILE}'。")
         print("请确保已成功运行 'feature_engineering.py' 并生成了该文件。")
@@ -42,13 +46,12 @@ def prepare_model_data():
     for col in features:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     
-    # 仅基于特征列和目标列来删除含有 NaN 的行
-    print(f"在第一次dropna之前的数据形状: {df.shape}") # <-- 诊断信息2
+    print(f"在第一次dropna之前的数据形状: {df.shape}")
     df.dropna(subset=features + [TARGET], inplace=True)
-    print(f"在第一次dropna之后的数据形状: {df.shape}") # <-- 诊断信息3
+    print(f"在第一次dropna之后的数据形状: {df.shape}")
     
     if df.empty:
-        print("错误：在数据清洗后，DataFrame 变为空。请检查 'final_master_dataset.csv' 的数据质量。")
+        print("错误：在数据清洗后，DataFrame 变为空。")
         return
 
     print(f"选定的数值特征数量: {len(features)}")
@@ -62,30 +65,43 @@ def prepare_model_data():
         print("错误: 'Ticker' 列不存在，无法按股票分组进行缩放。")
         return
     
+    # 注意：这里我们对特征进行了缩放，这对神经网络很好。
+    # 但对回测来说，有时我们需要原始价格。
+    # 假设你的回测脚本能处理缩放后的数据，或者数据中包含未缩放的价格列（如 Close, Open 等非 features 列）。
     df[features] = df.groupby('Ticker', group_keys=False)[features].apply(
         lambda x: pd.DataFrame(scaler.fit_transform(x), index=x.index, columns=x.columns)
     )
     
-    # --- 关键修改：注释掉或移除第二次 dropna ---
-    # 缩放后可能会产生新的NaN（如果一个组内所有值都相同），但这个操作可能过于激进。
-    # 我们先注释掉它，因为第一次dropna已经保证了核心数据的完整性。
-    # df.dropna(inplace=True) 
-    print(f"特征缩放后，第二次dropna前的数据形状: {df.shape}") # <-- 诊断信息4
+    print(f"特征缩放完成。当前形状: {df.shape}")
+
+    # ==========================================
+    # --- [关键新增] 3.5 保存用于回测的完整数据 ---
+    # ==========================================
+    # 这一步是为了解决 12_backtest_shortterm.py 的 "No such file" 错误
+    print(f"正在保存回测专用全量数据到: {BACKTEST_DATA_FILE} ...")
     
-    print("特征缩放完成。")
+    # 确保目录存在
+    os.makedirs(BACKTEST_DATA_DIR, exist_ok=True)
+    
+    # 保存完整数据（包含 Date, Ticker, Target 以及缩放后的 Features）
+    # index=False 确保 Date 和 Ticker 作为列保存，方便回测脚本读取
+    df.to_csv(BACKTEST_DATA_FILE, index=False)
+    print("回测数据保存成功！")
+    # ==========================================
+
 
     # --- 4. 划分数据集 (训练集、验证集、测试集) ---
     print("正在按时间划分数据集...")
     
+    # 重置索引以确保 Date 变为列，然后再设为索引，逻辑没问题
     df.reset_index(drop=True, inplace=True)
     df.set_index('Date', inplace=True)
     
     times = sorted(df.index.unique())
-    print(f"用于划分的唯一日期数量: {len(times)}") # <-- 诊断信息5
+    print(f"用于划分的唯一日期数量: {len(times)}")
     
     if len(times) < 4: 
         print("错误：数据量太少，无法划分为训练/验证/测试集。")
-        print("这很可能是因为在数据清洗(dropna)阶段移除了过多的行。请检查上方的'数据形状'诊断信息。")
         return
 
     last_15pct_date = times[-int(0.15 * len(times))]
@@ -104,7 +120,7 @@ def prepare_model_data():
     print(f"验证集大小: {X_val.shape[0]}")
     print(f"测试集大小: {X_test.shape[0]}")
 
-    # --- 6. 保存处理好的数据 ---
+    # --- 6. 保存模型训练数据 ---
     os.makedirs(MODEL_INPUT_PATH, exist_ok=True)
     
     X_train.to_csv(MODEL_INPUT_PATH / 'X_train.csv', index=True)
