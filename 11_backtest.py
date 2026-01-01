@@ -13,15 +13,12 @@ from sklearn.preprocessing import StandardScaler
 # ==========================================
 DATA_PATH = 'data/finalized/data_with_targets.csv'
 PARAMS_PATH = 'models/tuned_models/best_hyperparameters.json'
-RESULTS_DIR = 'data/backtest_results'
+RESULTS_DIR = 'backtest_results'  # 修正路径，确保与Week 13一致
 SEQ_LENGTH = 60
 
-# 交易策略配置 (优化版)
+# 交易策略配置
 INITIAL_CAPITAL = 10000
-
-# 关键修改：引入置信度阈值，防止长期模型在 0.5 附近频繁震荡
-# 只有当模型非常有信心时才交易
-CONFIDENCE_THRESHOLD = 0.05  # 0.5 +/- 0.05 -> Buy > 0.55, Sell < 0.45
+CONFIDENCE_THRESHOLD = 0.05 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -83,43 +80,39 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 # ==========================================
-# 3. 辅助函数 (关键修复)
+# 3. 辅助函数
 # ==========================================
-def create_sequences(data_x, data_y, prices, seq_length):
-    xs, ys, ps = [], [], []
+def create_sequences(data_x, data_y, prices, dates, seq_length):
+    xs, ys, ps, ds = [], [], [], []
     for i in range(len(data_x) - seq_length):
         xs.append(data_x[i:(i + seq_length)])
         ys.append(data_y[i + seq_length])
         ps.append(prices[i + seq_length])
-    return np.array(xs), np.array(ys), np.array(ps)
+        ds.append(dates[i + seq_length]) # 同时保存日期
+    return np.array(xs), np.array(ys), np.array(ps), np.array(ds)
 
 def prepare_data_split(df, ticker, horizon_days):
-    """
-    修复了数据泄露问题：先划分 Train/Test，再进行 Scaling
-    """
     t_df = df[df['Ticker'] == ticker].copy()
     if 'Date' in t_df.columns:
         t_df['Date'] = pd.to_datetime(t_df['Date'])
         t_df = t_df.sort_values('Date')
     
-    # 确定价格列
     price_col = 'Close' if 'Close' in t_df.columns else t_df.select_dtypes(include=[np.number]).columns[0]
     
-    # 生成 Target (注意：最后 horizon_days 行的 Target 是 NaN，需要去掉)
+    # 生成 Target
     t_df['Target'] = (t_df[price_col].shift(-horizon_days) > t_df[price_col]).astype(float)
-    t_df = t_df.dropna(subset=['Target']) # 这里会丢弃最后几天的数据
+    t_df = t_df.dropna(subset=['Target'])
     
-    # 特征选择
     feature_cols = [c for c in t_df.columns if c not in ['Date', 'Ticker', 'Target'] and not c.startswith('target_')]
     numeric_cols = t_df.select_dtypes(include=[np.number]).columns.tolist()
     feature_cols = [c for c in feature_cols if c in numeric_cols]
     
-    # 提取原始数据
     raw_x = t_df[feature_cols].values
     raw_y = t_df['Target'].values
     raw_prices = t_df[price_col].values
+    raw_dates = t_df['Date'].values # 获取原始日期
     
-    # --- 关键修复：按时间切分 Train/Test ---
+    # 切分 Train/Test
     split_idx = int(len(raw_x) * 0.8)
     
     train_x_raw = raw_x[:split_idx]
@@ -131,19 +124,21 @@ def prepare_data_split(df, ticker, horizon_days):
     train_prices = raw_prices[:split_idx]
     test_prices = raw_prices[split_idx:]
     
-    # --- 关键修复：只在 Train 上 Fit Scaler ---
+    train_dates = raw_dates[:split_idx]
+    test_dates = raw_dates[split_idx:]
+    
+    # Scaling
     scaler = StandardScaler()
     train_x_scaled = scaler.fit_transform(train_x_raw)
-    test_x_scaled = scaler.transform(test_x_raw) # 用训练集的参数转换测试集
+    test_x_scaled = scaler.transform(test_x_raw)
     
-    # 生成序列
-    X_train, y_train, _ = create_sequences(train_x_scaled, train_y, train_prices, SEQ_LENGTH)
-    X_test, y_test, prices_test = create_sequences(test_x_scaled, test_y, test_prices, SEQ_LENGTH)
+    # 生成序列 (注意这里增加了 dates 返回)
+    X_train, y_train, _, _ = create_sequences(train_x_scaled, train_y, train_prices, train_dates, SEQ_LENGTH)
+    X_test, y_test, prices_test, dates_test = create_sequences(test_x_scaled, test_y, test_prices, test_dates, SEQ_LENGTH)
     
-    return X_train, y_train, X_test, y_test, prices_test, len(feature_cols)
+    return X_train, y_train, X_test, y_test, prices_test, dates_test, len(feature_cols)
 
 def train_and_predict(model_cls, params, input_dim, X_train, y_train, X_test):
-    """训练并预测"""
     model_type = params['model_type']
     dropout = params['dropout']
     
@@ -162,8 +157,7 @@ def train_and_predict(model_cls, params, input_dim, X_train, y_train, X_test):
     yt = torch.FloatTensor(y_train).unsqueeze(1).to(device)
     
     model.train()
-    # 增加 Epochs，因为现在数据更“真实难学”了
-    epochs = 20 
+    epochs = 15 # 稍微减少epoch以加快演示速度，实际可增加
     for _ in range(epochs):
         optimizer.zero_grad()
         out = model(xt)
@@ -193,6 +187,7 @@ def run_backtest_engine():
         
     df = pd.read_csv(DATA_PATH)
     results = []
+    all_predictions_list = [] # 用于收集所有预测结果
     
     for ticker, horizons in best_params_registry.items():
         for horizon_name, params in horizons.items():
@@ -200,30 +195,40 @@ def run_backtest_engine():
             
             horizon_days = {'Short': 1, 'Mid': 5, 'Long': 10}.get(horizon_name, 1)
             
-            # 1. 准备数据 (使用修复后的函数)
             try:
-                X_train, y_train, X_test, y_test, prices_test, input_dim = prepare_data_split(df, ticker, horizon_days)
+                # 注意这里接收了 dates_test
+                X_train, y_train, X_test, y_test, prices_test, dates_test, input_dim = prepare_data_split(df, ticker, horizon_days)
             except ValueError:
                 print("   ⚠️ Not enough data to split.")
                 continue
 
-            if len(X_train) < 100 or len(X_test) < 10:
+            if len(X_train) < 50 or len(X_test) < 10:
                 print("   ⚠️ Not enough data.")
                 continue
                 
-            # 2. 训练并预测
             try:
                 probs = train_and_predict(None, params, input_dim, X_train, y_train, X_test)
             except Exception as e:
                 print(f"   ❌ Model Error: {e}")
                 continue
             
-            # 3. 执行交易策略 (加入置信度过滤)
+            # --- 收集详细预测数据 (为 Week 13 准备) ---
+            # 我们只收集 Mid-Term 的数据用于中期策略绘图，或者全部收集
+            pred_df = pd.DataFrame({
+                'Date': dates_test,
+                'Ticker': ticker,
+                'Horizon': horizon_name,
+                'Probability': probs,
+                'Target': y_test,
+                'Close': prices_test
+            })
+            all_predictions_list.append(pred_df)
+            
+            # --- 执行交易策略 ---
             cash = INITIAL_CAPITAL
             position = 0 
             trades = 0
             
-            # 动态调整阈值：Long 模型需要更高的确定性，或者更宽的容错
             buy_thresh = 0.50 + CONFIDENCE_THRESHOLD
             sell_thresh = 0.50 - CONFIDENCE_THRESHOLD
             
@@ -231,7 +236,6 @@ def run_backtest_engine():
                 current_price = prices_test[i]
                 prob = probs[i]
                 
-                # 只有当概率显著偏离 0.5 时才操作
                 if prob > buy_thresh and position == 0:
                     position = cash / current_price
                     cash = 0
@@ -241,22 +245,17 @@ def run_backtest_engine():
                     position = 0
                     trades += 1
                 
-            # 4. 结算
             final_price = prices_test[-1]
             final_value = cash + (position * final_price)
             roi = (final_value - INITIAL_CAPITAL) / INITIAL_CAPITAL * 100
-            
-            # 计算基准
             initial_price = prices_test[0]
             buy_hold_roi = (final_price - initial_price) / initial_price * 100
             
-            # 计算胜率 (方向预测准确率)
-            # 将概率转为 0/1 预测
             pred_dirs = (probs > 0.5).astype(float)
             accuracy = (pred_dirs == y_test).mean() * 100
             
             print(f"   💰 Final: ${final_value:.2f} | ROI: {roi:.2f}% | Trades: {trades}")
-            print(f"   🎯 Win Rate (Accuracy): {accuracy:.2f}%")
+            print(f"   🎯 Win Rate: {accuracy:.2f}%")
             
             results.append({
                 'Ticker': ticker,
@@ -268,18 +267,31 @@ def run_backtest_engine():
                 'Win_Rate': f"{accuracy:.1f}%"
             })
 
+    # 1. 保存回测摘要
     res_df = pd.DataFrame(results)
-    save_path = os.path.join(RESULTS_DIR, 'backtest_summary.csv')
-    res_df.to_csv(save_path, index=False)
+    summary_path = os.path.join(RESULTS_DIR, 'backtest_summary.csv')
+    res_df.to_csv(summary_path, index=False)
     
+    # 2. 保存详细预测文件 (解决 Week 13 报错的关键)
+    if all_predictions_list:
+        all_preds_df = pd.concat(all_predictions_list)
+        # 筛选出 Mid-Term 的预测，保存为 model_predictions.csv
+        # 如果你想让 Week 13 跑通，通常它需要 Mid-Term 的数据
+        mid_preds = all_preds_df[all_preds_df['Horizon'] == 'Mid'].copy()
+        if mid_preds.empty:
+             # 如果没有 Mid term，就用全部，防止报错
+             mid_preds = all_preds_df
+        
+        pred_save_path = os.path.join(RESULTS_DIR, 'model_predictions.csv')
+        mid_preds.to_csv(pred_save_path, index=False)
+        print(f"\n✅ 详细预测文件已保存: {pred_save_path}")
+
     if not res_df.empty:
         print("\n" + "="*60)
-        # 格式化输出，方便查看
         print(res_df[['Ticker', 'Horizon', 'Model', 'ROI', 'Buy_Hold_ROI', 'Trades', 'Win_Rate']].to_string(index=False))
 
 if __name__ == "__main__":
     run_backtest_engine()
-
 
 
 
