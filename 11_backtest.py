@@ -13,7 +13,7 @@ from sklearn.preprocessing import StandardScaler
 # ==========================================
 DATA_PATH = 'data/finalized/data_with_targets.csv'
 PARAMS_PATH = 'models/tuned_models/best_hyperparameters.json'
-RESULTS_DIR = 'backtest_results'  # 修正路径，确保与Week 13一致
+RESULTS_DIR = 'backtest_results'  # 确保结果目录正确
 SEQ_LENGTH = 60
 
 # 交易策略配置
@@ -157,7 +157,7 @@ def train_and_predict(model_cls, params, input_dim, X_train, y_train, X_test):
     yt = torch.FloatTensor(y_train).unsqueeze(1).to(device)
     
     model.train()
-    epochs = 15 # 稍微减少epoch以加快演示速度，实际可增加
+    epochs = 15 # 演示用，实际可增加
     for _ in range(epochs):
         optimizer.zero_grad()
         out = model(xt)
@@ -176,7 +176,8 @@ def train_and_predict(model_cls, params, input_dim, X_train, y_train, X_test):
 # 4. 主回测引擎
 # ==========================================
 def run_backtest_engine():
-    print("🚀 Starting Week 11: Backtesting Engine (Fixed Leakage)...")
+    print("🚀 Starting Week 11: Backtesting Engine...")
+    print(f"📂 Results will be saved to: {RESULTS_DIR}")
     
     if not os.path.exists(PARAMS_PATH):
         print("❌ Best hyperparameters not found.")
@@ -187,7 +188,9 @@ def run_backtest_engine():
         
     df = pd.read_csv(DATA_PATH)
     results = []
-    all_predictions_list = [] # 用于收集所有预测结果
+    
+    # === 新增：专门用于收集 Mid-term 数据的列表 ===
+    midterm_predictions = [] 
     
     for ticker, horizons in best_params_registry.items():
         for horizon_name, params in horizons.items():
@@ -196,7 +199,6 @@ def run_backtest_engine():
             horizon_days = {'Short': 1, 'Mid': 5, 'Long': 10}.get(horizon_name, 1)
             
             try:
-                # 注意这里接收了 dates_test
                 X_train, y_train, X_test, y_test, prices_test, dates_test, input_dim = prepare_data_split(df, ticker, horizon_days)
             except ValueError:
                 print("   ⚠️ Not enough data to split.")
@@ -212,17 +214,16 @@ def run_backtest_engine():
                 print(f"   ❌ Model Error: {e}")
                 continue
             
-            # --- 收集详细预测数据 (为 Week 13 准备) ---
-            # 我们只收集 Mid-Term 的数据用于中期策略绘图，或者全部收集
-            pred_df = pd.DataFrame({
-                'Date': dates_test,
-                'Ticker': ticker,
-                'Horizon': horizon_name,
-                'Probability': probs,
-                'Target': y_test,
-                'Close': prices_test
-            })
-            all_predictions_list.append(pred_df)
+            # === 关键修改：如果是 Mid 策略，收集详细数据供 Week 13 使用 ===
+            if horizon_name == 'Mid':
+                mid_df = pd.DataFrame({
+                    'Date': dates_test,
+                    'Ticker': ticker,
+                    'Signal': probs,       # 预测概率
+                    'Close': prices_test,  # 收盘价
+                    'Target': y_test       # 真实标签
+                })
+                midterm_predictions.append(mid_df)
             
             # --- 执行交易策略 ---
             cash = INITIAL_CAPITAL
@@ -271,20 +272,19 @@ def run_backtest_engine():
     res_df = pd.DataFrame(results)
     summary_path = os.path.join(RESULTS_DIR, 'backtest_summary.csv')
     res_df.to_csv(summary_path, index=False)
+    print(f"\n✅ Summary saved to: {summary_path}")
     
-    # 2. 保存详细预测文件 (解决 Week 13 报错的关键)
-    if all_predictions_list:
-        all_preds_df = pd.concat(all_predictions_list)
-        # 筛选出 Mid-Term 的预测，保存为 model_predictions.csv
-        # 如果你想让 Week 13 跑通，通常它需要 Mid-Term 的数据
-        mid_preds = all_preds_df[all_preds_df['Horizon'] == 'Mid'].copy()
-        if mid_preds.empty:
-             # 如果没有 Mid term，就用全部，防止报错
-             mid_preds = all_preds_df
+    # 2. 保存 Week 13 所需的 Mid-term 详细预测文件
+    if midterm_predictions:
+        all_mid_df = pd.concat(midterm_predictions)
+        # 确保日期格式正确
+        all_mid_df['Date'] = pd.to_datetime(all_mid_df['Date'])
         
-        pred_save_path = os.path.join(RESULTS_DIR, 'model_predictions.csv')
-        mid_preds.to_csv(pred_save_path, index=False)
-        print(f"\n✅ 详细预测文件已保存: {pred_save_path}")
+        mid_file_path = os.path.join(RESULTS_DIR, 'daily_signals_midterm.csv')
+        all_mid_df.to_csv(mid_file_path, index=False)
+        print(f"✅ [重要] Week 13 所需文件已生成: {mid_file_path}")
+    else:
+        print("⚠️ 警告: 未生成 Mid-term 预测数据，Week 13 可能会报错。请检查 best_hyperparameters.json 是否包含 'Mid' 策略。")
 
     if not res_df.empty:
         print("\n" + "="*60)
