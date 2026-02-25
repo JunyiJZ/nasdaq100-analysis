@@ -166,7 +166,8 @@ class AIRecommender:
     def fetch_and_prepare_data(self):
         try:
             df = yf.download(self.ticker, period="2y", progress=False, auto_adjust=False)
-            if len(df) < 100: return None
+            if df.empty or len(df) < 100: 
+                return None
             
             if isinstance(df.columns, pd.MultiIndex): 
                 df.columns = df.columns.get_level_values(0)
@@ -175,7 +176,8 @@ class AIRecommender:
             data = df['Close'].values.reshape(-1, 1)
             self.data_scaled = self.scaler.fit_transform(data)
             return df
-        except Exception:
+        except Exception as e:
+            print(f"Error fetching data for {self.ticker}: {e}")
             return None
 
     def calculate_risk_metrics(self):
@@ -238,8 +240,9 @@ class AIRecommender:
         使用随机森林作为代理模型 (Surrogate Model)，
         提取技术指标的 Feature Importance，并生成自然语言解释。
         """
+        # 修改点：返回空字典 {} 而不是 {"No Data": 0}，以便触发 Dashboard 的 Mock 回退
         if self.df_raw is None or len(self.df_raw) < 50:
-            return "HOLD", 0.5, {"No Data": 0}, "Insufficient data to generate explanation."
+            return "HOLD", 0.5, {}, "Insufficient data to generate explanation."
 
         df = self.df_raw.copy()
         
@@ -266,8 +269,9 @@ class AIRecommender:
         df['Target'] = df['Close'].shift(-5) / df['Close'] - 1
         df.dropna(inplace=True)
 
+        # 修改点：返回空字典 {}
         if len(df) < 20:
-            return "HOLD", 0.5, {"Data too short": 0}, "Not enough valid feature data."
+            return "HOLD", 0.5, {}, "Not enough valid feature data."
 
         features = ['Return_5d', 'Volatility', 'RSI_14', 'MACD', 'SMA_20_Dist']
         X = df[features]
@@ -287,7 +291,6 @@ class AIRecommender:
             val = latest_data[feat]
             
             # 简单的业务逻辑判断方向：
-            # 例如：RSI < 30 是看涨(正向)，RSI > 70 是看跌(负向)
             direction = 1 
             if feat == 'RSI_14':
                 if val > 65: direction = -1
