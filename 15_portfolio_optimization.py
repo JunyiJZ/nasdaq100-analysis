@@ -91,30 +91,34 @@ def load_strategy_curve(filepath, strategy_name):
         return None
 
 # ==========================================
-# 3. MPT 优化逻辑
+# 3. MPT 优化逻辑 (已修改为收益优先)
 # ==========================================
 def portfolio_annualised_performance(weights, mean_returns, cov_matrix):
     returns = np.sum(mean_returns * weights) * 252
     std = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights))) * np.sqrt(252)
     return std, returns
 
-def neg_sharpe_ratio(weights, mean_returns, cov_matrix, risk_free_rate=0.02):
+# 新增：以收益为主，风险为辅的目标函数
+def objective_max_return_penalty(weights, mean_returns, cov_matrix, risk_aversion):
     p_var, p_ret = portfolio_annualised_performance(weights, mean_returns, cov_matrix)
-    if p_var == 0: return 0
-    return -(p_ret - risk_free_rate) / p_var
+    # 目标：最大化 (收益 - 风险惩罚)
+    # 因为 scipy.minimize 求的是最小值，所以我们返回负值
+    return -(p_ret - risk_aversion * p_var)
 
-def max_sharpe_ratio(mean_returns, cov_matrix, risk_free_rate=0.02):
+# 新增：调用新的目标函数进行优化
+def optimize_for_return(mean_returns, cov_matrix, risk_aversion=0.5):
     num_assets = len(mean_returns)
-    args = (mean_returns, cov_matrix, risk_free_rate)
+    args = (mean_returns, cov_matrix, risk_aversion)
     constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
     bounds = tuple((0.0, 1.0) for asset in range(num_assets))
     init_guess = num_assets * [1./num_assets,]
-    result = sco.minimize(neg_sharpe_ratio, init_guess, args=args,
+    
+    result = sco.minimize(objective_max_return_penalty, init_guess, args=args,
                         method='SLSQP', bounds=bounds, constraints=constraints)
     return result
 
 # ==========================================
-# 4. 主程序 (核心修复部分)
+# 4. 主程序
 # ==========================================
 def run_portfolio_optimization():
     print("--- Starting Portfolio Optimization (v3 Auto-Resample) ---")
@@ -156,7 +160,6 @@ def run_portfolio_optimization():
     aligned_data = {}
     for name, s in strategies.items():
         # 3. 重新索引并前向填充 (ffill)
-        # 这会将月线数据 (Monthly) 扩展为日线数据 (Daily)，填补中间的空缺
         aligned_s = s.reindex(common_index, method='ffill')
         aligned_data[name] = aligned_s
 
@@ -166,13 +169,11 @@ def run_portfolio_optimization():
     if len(df_combined) < 10:
         print("❌ Error: Still not enough overlapping data after resampling.")
         return
-
-    # --- 后续计算保持不变 ---
     
     # 计算日收益率
     returns = df_combined.pct_change().dropna()
     
-    # 简单的异常值清洗 (防止某个策略第一天收益率极其巨大)
+    # 简单的异常值清洗
     returns = returns[np.abs(returns) < 0.5] 
 
     mean_returns = returns.mean()
@@ -189,9 +190,16 @@ def run_portfolio_optimization():
     except Exception as e:
         print(f"⚠️ Could not save correlation chart: {e}")
 
-    # 优化
-    print("\n--- Optimizing... ---")
-    result = max_sharpe_ratio(mean_returns, cov_matrix)
+    # 优化：使用新的优化函数
+    print("\n--- Optimizing (Target: Maximize Return with Risk Penalty) ---")
+    
+    # 这里的 risk_aversion 参数决定了风险的惩罚力度。
+    # 设为 0.2 表示非常看重收益，不太在乎风险。
+    # 设为 1.0 表示收益和风险同等重要。
+    # 你可以根据需要调整这个值 (例如 0.1 到 0.5 之间)
+    RISK_AVERSION_COEF = 1.0 
+    
+    result = optimize_for_return(mean_returns, cov_matrix, risk_aversion=RISK_AVERSION_COEF)
     optimal_weights = result.x
     
     allocation = pd.DataFrame({
@@ -200,7 +208,7 @@ def run_portfolio_optimization():
         'Percentage': np.round(optimal_weights * 100, 2)
     })
     
-    print("\n🏆 Optimal Portfolio Allocation:")
+    print(f"\n🏆 Optimal Portfolio Allocation (Risk Aversion = {RISK_AVERSION_COEF}):")
     print(allocation)
     allocation.to_csv(OUTPUT_WEIGHTS, index=False)
 
@@ -216,15 +224,19 @@ def run_portfolio_optimization():
         p_std, p_ret = portfolio_annualised_performance(weights, mean_returns, cov_matrix)
         results[0,i] = p_std
         results[1,i] = p_ret
+        # 颜色映射依然保留夏普比率作为参考
         results[2,i] = (p_ret - 0.02) / p_std if p_std != 0 else 0
 
     opt_std, opt_ret = portfolio_annualised_performance(optimal_weights, mean_returns, cov_matrix)
     
     plt.figure(figsize=(10, 6))
     plt.scatter(results[0,:], results[1,:], c=results[2,:], cmap='viridis', s=10, alpha=0.5)
-    plt.colorbar(label='Sharpe Ratio')
-    plt.scatter(opt_std, opt_ret, marker='*', color='red', s=200, label='Optimal Portfolio')
-    plt.title('Efficient Frontier')
+    plt.colorbar(label='Sharpe Ratio (Reference)')
+    
+    # 标记新的最优点
+    plt.scatter(opt_std, opt_ret, marker='*', color='red', s=250, label='Optimal Portfolio (Return Focused)')
+    
+    plt.title('Efficient Frontier (Max Return Objective)')
     plt.xlabel('Risk (Volatility)')
     plt.ylabel('Return')
     plt.legend()
